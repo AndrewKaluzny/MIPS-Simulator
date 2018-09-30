@@ -1,0 +1,748 @@
+ /*  
+  *  David Welch, Andrew Kaluzny, Zachery Woods  A.K.A the ENGINERDS
+  *  ECE 353 - Computer Systems Lab I
+  *  Lab 3 - Pipelined Machine
+  *  Professor Krishna
+  *  November 13th, 2017
+  */ 
+
+ /*
+  *  Instructions for interpreter to support:
+  *     add		add $d, $s, $t	  ----  R[rd] = R[rs] + R[rt]   ----------------------------	OPCODE/FUNCT:	0x0/0x20
+  *   	sub		sub $d, $s, $t	  ----  R[rd] = R[rs] - R[rt]   ----------------------------	OPCODE/FUNCT:	0x0/0x22
+  *   	addi	addi $t, $s, imm	--  R[rt] = R[rs] + SignExtImm   -----------------------	OPCODE/FUNCT:	0x8
+  *   	mul 	mul $d, $s, $t	  ----  R[rd] = R[rs] * R[rt]   ----------------------------	OPCODE/FUNCT:	0x0/0x18
+  *   	lw		lw $t, offset($s)	--  R[rt] = M[R[rs] + SignExtImm]   --------------------	OPCODE/FUNCT:	0x23
+  *   	sw		sw $t, offset($s)	--  M[R[rs] + SignExtImm] = R[rt]	--------------------	OPCODE/FUNCT:	0x2B
+  *   	beq		beq $s, $t, offset	--  if(R[rs] == R[rt]) {PC = PC + 4 + offset;}   -------	OPCODE/FUNCT:	0x4
+  */
+
+ /*
+  *  How to run the code:
+  *   - On quark... save the code as sim-mips.c
+  *          1) Make file: vim sim-mips.c
+  *          2) Paste: i --> shift + INS
+  *          3) Save: ESC --> shift + ZZ
+  *          4) Also make input.txt and output.txt files
+  *   - Compile the code with the GNU compiler (GCC)
+  *          gcc sim-mips.c -o sim-mips
+  *   - Execute the code
+  *         1) For single-cycle mode, enter
+  *             ./sim-mips -s m n c input_name output_name
+  *         2) For batch mode, enter
+  *             ./sim-mips -b m n c input_name output_name
+  *
+  *  Inputs:
+  *     -s ------------> "Single-cycle" mode ("-s")
+  *     -b ------------> "Batch" mode ("-b")
+  *      m ------------> Number of cycles needed by multiplication (int)
+  *      n ------------> Number of cycles needed by other operation (int)
+  *      c ------------> Number of cycles needed by memory access (int)
+  *      input_name ---> Name of the input file (string)
+  *      output_name --> Name of the output file (string)
+  */ 
+
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+// CODE START
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+// INCLUDE - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <assert.h>
+
+// DEFINE - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+#define SINGLE 1
+#define BATCH 0
+#define REG_NUM 32
+
+// struct & enum - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+enum Inst {ADD = 0x20, ADDI = 0x8, SUB = 0x22, MULT = 0x18, BEQ = 0x4, LW = 0x2B, SW = 0x23}; // opcodes for use in inst declarations -A
+struct inst{
+   	int opcode;
+	int rs;
+	int rt;
+	int rd;
+	int imm;
+};
+
+// FUNCTION DECLARATIONS - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+void print_inst(struct inst n);
+struct inst strtoinst(char*, long*);
+int getRegNum(char*);
+int isHazard(struct inst curr, struct inst prev, struct inst prev2, struct inst prev3);
+void IF(struct inst mips_inst,struct inst *latch, int *IF_c,int c);
+void ID(struct inst *IF_ID_latch, struct inst *ID_EX_latch, long mips_reg_array[], int *ID_c);
+void EX(struct inst *ex_mem, struct inst *id_ex, int *ex_count, int mul_m, int else_n, long r[]);
+void MEM(struct inst *mem_wb, struct inst *ex_mem, int load_store_c, int *mem_count, long r[], long m[], long *pgm_count, int *inst_count, int n_inst);
+void WB(struct inst *mem_wb, int *wb_count, long r[], long m[]);
+
+// MAIN - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
+int main (int argc, char *argv[]){
+    // VARIABLES DEFINED FOR US - - - - - - - - - - - - - - - - - - - - - - - - 
+	int sim_mode = 0;          // Mode flag, 1 for single-cycle, 0 for batch
+	int c;                     // Number of cycles needed by memory access
+	int m;                     // Number of cycles needed by multiplication
+	int n;                     // Number of cycles needed by other operation
+	int i;                     // for loop counter
+	long mips_reg[REG_NUM];    // Array of MIPS registers
+	long pgm_c = 0;            // Program counter
+	long sim_cycle = 0;        // Simulation cycle counter
+	int test_counter = 0;
+	
+	// VARIABLES WE DEFINE - - - - - - - - - - - - - - - - - - - - - - - - - - -
+	long data_mem[512];        // Data memory of 4 bytes * 512 addresses = 512 words = 2 kB
+	struct inst inst_mem[512]; // Instruction memory of size 512 kB
+	int numInstructions;       // Number of instructions in inst_mem
+	
+	int inst_c = 0; // Instruction counter
+	int IF_c = 0;   // Temp # of cycles where each stage is used                                                                                                            
+	int ID_c = 0;              
+	int EX_c = 0;                                                                                                                          
+	int MEM_c = 0;
+	int WB_c = 0;
+	
+	int IF_tc = 0;  // Running total of cycles where each stage is used                                                                                                            
+	int ID_tc = 0;              
+	int EX_tc = 0;                                                                                                                          
+	int MEM_tc = 0;
+	int WB_tc = 0;
+	int max;
+	int x = 7;	//	For assertions 
+	
+	struct inst IF_ID;  // Latches in between stages
+	struct inst ID_EX;         
+	struct inst EX_MEM;        
+	struct inst MEM_WB;
+	
+	struct inst nop;    // nop
+	struct inst hs;	    // haltSimulation
+	hs.opcode = -1;	    // haltSimulation opcode set to -1
+	
+	struct inst prev;   // Used as inputs to isHazard
+	struct inst prev2;
+	struct inst prev3;
+	
+	double ifUtil = 0;  // ifUtil = IF_tc / sim_cycles = Instruction Fetch Utilization = How often the Instruction Fetch is being used in terms of cycles
+	double idUtil = 0;
+	double exUtil = 0;
+	double memUtil = 0;
+	double wbUtil = 0;
+	
+	char* inputString;   // Used for taking input     
+	
+	FILE* input = NULL;  // input is the input file
+	FILE* output = NULL; // output is the output file
+	
+	// Output the command line inputs
+	printf("The arguments are:");
+	for(i = 1; i < argc; i++){
+		printf("%s ", argv[i]);
+	}
+	printf("\n");
+	
+	// If there are 6 command line inputs (argv[0] represents the name of our executable, and is unimportant)
+	if(argc == 7){
+	    // If the first command line input is "-s" (single-cycle mode)
+		if(strcmp("-s", argv[1]) == 0){
+			sim_mode = SINGLE; // Set mode to what Andrew and I will be after this lab :'(
+		}
+		// If the first command line input is "-b" (batch mode)
+		else if(strcmp("-b", argv[1]) == 0){
+			sim_mode = BATCH; // Set mode to a fraction of the number of cookies I want
+		}
+		// If an incorrect mode was requested
+		else{
+			printf("Wrong sim mode chosen\n");
+			exit(0); // https://i.imgur.com/EZ3giKy.jpg
+		}
+		
+		// Accept command line inputs 2-6
+		m = atoi(argv[2]);
+		n = atoi(argv[3]);
+		c = atoi(argv[4]);
+		input = fopen(argv[5], "r");
+		output = fopen(argv[6], "w");
+	}
+	else{
+		printf("Usage: ./sim-mips -s m n c input_name output_name (single-cycle mode)\n or \n ./sim-mips -b m n c input_name  output_name(batch mode)\n");
+		printf("m, n, c stand for number of cycles needed by multiplication, other operation, and memory access, respectively\n");
+		exit(0);
+	}
+	
+	// If the input file doesn't exist
+	if(input == NULL){
+		printf("Unable to open input or output file\n");
+		exit(0);
+	}
+	
+	// If the output file doesn't exist
+	if(output == NULL){
+		printf("Cannot create output file\n");
+		exit(0);
+	}
+	
+	// Initialize registers and program counter
+	for (i = 0; i < REG_NUM; i++){
+		mips_reg[i] = 0;
+	}
+	
+	// OUR CODE STARTS HERE - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+    inputString = malloc(200*sizeof(char)); // Allocate memory for our input string
+
+	// inputString = string from input file representing next instruction (if there is one)
+    for (i = 0; (i < 512) && fgets(inputString, 100, input); i++){
+		inst_mem[i] = strtoinst(inputString, mips_reg);
+	}
+	
+	numInstructions = i - 1; // i - 1 because haltSimulation isn't really an instruction
+	
+	// We won't have any errors before the first 2 inscructions
+	prev = nop;
+	prev2 = nop;
+	prev3 = nop;
+	
+	// Assertions
+	assert(x == 7);
+	assert(n > 0);
+	assert(m > 0);
+	assert(c > 0);
+	
+	// Loop through the instructions
+	for(pgm_c = 0, inst_c = 0; inst_c < numInstructions + 4; ){
+		// Run a cycle
+		WB(&MEM_WB, &WB_c, mips_reg, data_mem);                                                 // Write back
+		MEM(&MEM_WB, &EX_MEM, c, &MEM_c, mips_reg, data_mem, &pgm_c, &inst_c, numInstructions); // Data Memory
+		EX(&EX_MEM, &ID_EX, &EX_c, m, n, mips_reg);                                             // Execute
+		ID(&IF_ID, &ID_EX, mips_reg, &ID_c);                                                    // Instruction Decode
+		
+		// Instruction Fetch 
+		if (inst_c < numInstructions){                              // If we haven't hit haltSimulation yet
+			if(!isHazard(inst_mem[inst_c], prev, prev2, prev3)){    // AND there is NOT a hazard
+				IF(inst_mem[inst_c], &IF_ID, &IF_c, c);             // Instruction Fetch with next instruction
+				inst_c++;                                           // Increment the instruction counter
+				pgm_c += 4;
+				prev3 = prev2;
+				prev2 = prev;                               // Set the 2x previous instruction to the previous previous one
+		        prev = inst_mem[inst_c - 1];                // Set the previous instruction to the previous current one
+			}
+		    else{                           // If there IS a hazard
+		        IF(nop, &IF_ID, &IF_c, c);  // Instruction Fetch with nop
+		        prev3 = prev2;
+    			prev2 = prev;               // Set the 2x previous instruction to the previous previous one
+		        prev = nop;                 // We have a hazard, so set the previous instruction to a nop, because that's what we do to compensate for the hazard
+		    }
+		}
+		else{ // We've hit haltSimulation
+			IF(hs, &IF_ID, &IF_c, c);   // Instruction Fetch with haltSimulation
+			inst_c++;                   // Increment the instruction counter... / We're moving through the haltSimulation
+			prev3 = prev2;
+    		prev2 = prev;               // Set the 2x previous instruction to the previous previous one
+		    prev = nop;
+		}
+		
+		// Increment cycle counters
+        WB_tc  += WB_c;
+		MEM_tc += MEM_c;
+		EX_tc  += EX_c;
+		ID_tc  += ID_c;
+		IF_tc  += IF_c;
+		
+		// Determine the greatest cycle counter --> max
+		max = WB_c;
+		if(MEM_c > max){max = MEM_c;}
+		if(EX_c  > max){max = EX_c;}
+		if(ID_c  > max){max = ID_c;}
+		if(IF_c  > max){max = IF_c;}
+		
+		WB_c  = 0;
+		MEM_c = 0;
+		EX_c  = 0;
+		ID_c  = 0;
+		IF_c  = 0;
+		
+		//output code 2: the following code will output the register 
+        //value to screen at every cycle and wait for the ENTER key
+        //to be pressed; this will make it proceed to the next cycle 
+		if(sim_mode == 1){
+		    for(int x )
+    		    printf("cycle: %d register value: ", sim_cycle);
+    		
+    		for (i = 1; i < REG_NUM; i++){
+    			printf("%d  ", mips_reg[i]);
+    		}
+    		printf("program counter: %d\n", pgm_c);
+    		printf("press ENTER to continue\n");
+    		while(getchar() != '\n');
+	    }
+    	
+    	sim_cycle += max;
+    	test_counter++;
+    	assert(test_counter >= 0);
+	}
+	
+	// Calculate utilization of each stage
+	ifUtil = IF_tc / (double)sim_cycle;
+	idUtil = ID_tc / (double)sim_cycle;
+	exUtil = EX_tc / (double)sim_cycle;
+	memUtil = MEM_tc / (double)sim_cycle;
+	wbUtil = WB_tc / (double)sim_cycle;
+	//printf("stage utilization: %f  %f  %f  %f  %f \n", ifUtil, idUtil, exUtil, memUtil, wbUtil);
+	
+	// Add the following code to the end of the simulation, 
+    // to output statistics in batch mode
+	if(sim_mode == 0){
+		assert(ifUtil  >= 0);
+		assert(idUtil  >= 0);
+		assert(exUtil  >= 0);
+		assert(memUtil >= 0);
+		assert(wbUtil  >= 0);
+		assert(x == 7);
+		fprintf(output, "program name: %s\n", argv[5]);
+		fprintf(output, "stage utilization: %f  %f  %f  %f  %f \n", ifUtil, idUtil, exUtil, memUtil, wbUtil);
+                     // Add the (double) stage_counter/sim_cycle for each 
+                     // stage following sequence IF ID EX MEM WB
+		
+		fprintf(output, "register values ");
+		for (i = 1; i < REG_NUM; i++){
+			fprintf(output, "%d  ", mips_reg[i]);
+		}
+		fprintf(output, "%d\n", pgm_c);
+	}
+	
+	// Print the sim_cycle
+	printf("END OF MAIN FOR LOOP\n");
+	printf("sim_cycle = %d\n", sim_cycle);
+	
+	// Close the files
+    fclose(input);
+	fclose(output);
+}
+
+// FUNCTION DEFINITIONS - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
+
+void print_inst(struct inst n){
+	printf("	opcode: %d \n	rs: %d\n	rt: %d\n	rd: %d\n	imm: %d\n", n.opcode, n.rs, n.rt, n.rd, n.imm);
+}
+
+// Performs the functions of progScanner, regNumberConverter, and parser in one function
+struct inst strtoinst(char* inputString, long* mips_reg){
+    int i;
+    char delimiters[] = "\t ,\n()";
+    char** instructionFields;
+	struct inst final;
+	
+	// Initialize fields of inst to 0
+	final.opcode = 0;
+	final.rs = 0;
+	final.rt = 0;
+	final.rd = 0;
+	final.imm = 0;
+	
+	// Allocate memory for tokens of string
+    instructionFields = (char**)malloc(100 * sizeof(char*));
+    for (i = 0; i < 4; i++){
+       *(instructionFields + i) = (char*)malloc(20 * sizeof(char*));
+	}
+	
+	// Tokenize the given string
+    instructionFields[0] = strtok(inputString, delimiters);
+    instructionFields[1] = strtok(NULL, delimiters);
+    instructionFields[2] = strtok(NULL, delimiters);
+	instructionFields[3] = strtok(NULL, delimiters);
+	
+	// Match opcode with how we process registers
+	if (strcmp("add", instructionFields[0]) == 0){
+		// add 	$rd, $rs, $rt
+		final.opcode = ADD;
+		final.rd = getRegNum(instructionFields[1]);
+		final.rs = getRegNum(instructionFields[2]);
+		final.rt = getRegNum(instructionFields[3]);
+	}
+	else if (strcmp("sub", instructionFields[0]) == 0){
+		// sub 	$rd, $rs, $rt
+		final.opcode = SUB;
+		final.rd = getRegNum(instructionFields[1]);
+		final.rs = getRegNum(instructionFields[2]);
+		final.rt = getRegNum(instructionFields[3]);
+	}
+	else if (strcmp("addi", instructionFields[0]) == 0){
+		// addi $rt, $rs, imm
+		final.opcode = ADDI;
+		final.rt = getRegNum(instructionFields[1]);
+		final.rs = getRegNum(instructionFields[2]);
+		final.imm = (int)strtol(instructionFields[3], (char **)NULL, 10);
+		// Make sure immediate is an appropriate size
+		if (!(final.imm < 32768) || !(final.imm >= -32768)){
+			printf("Immediate field too large\n");
+			exit(0);
+		}
+	}
+	else if (strcmp("mul", instructionFields[0]) == 0){
+		// mul 	$rd, $rs, $rt
+		final.opcode = MULT;
+		final.rd = getRegNum(instructionFields[1]);
+		final.rs = getRegNum(instructionFields[2]);
+		final.rt = getRegNum(instructionFields[3]);
+	}
+	else if (strcmp("lw", instructionFields[0]) == 0){
+		// lw 	$rt, offset($rs)
+		final.opcode = LW;
+		final.rt = getRegNum(instructionFields[1]);
+		final.imm = (int)strtol(instructionFields[2], (char **)NULL, 10);
+		final.rs = getRegNum(instructionFields[3]);
+		// Make sure immediate is an appropriate size
+		if (!(final.imm < 33554432) || !(final.imm >= -33554432)){
+			printf("Immediate field too large\n");
+			exit(0);
+		}
+	}
+	else if (strcmp("sw", instructionFields[0]) == 0){
+		// sw 	$rt, offset($rs)
+		final.opcode = SW;
+		final.rt = getRegNum(instructionFields[1]);
+		final.imm = (int)strtol(instructionFields[2], (char **)NULL, 10);
+		final.rs = getRegNum(instructionFields[3]);
+		// Make sure immediate is an appropriate size
+		if (!(final.imm < 33554432) || !(final.imm >= -33554432)){
+			printf("Immediate field too large\n");
+			exit(0);
+		}
+	}
+	else if (strcmp("beq", instructionFields[0]) == 0){
+		// beq 	$rs, $rt, offset
+		final.opcode = BEQ;
+		final.rs = getRegNum(instructionFields[1]);
+		final.rt = getRegNum(instructionFields[2]);
+		final.imm = (int)strtol(instructionFields[3], (char **)NULL, 10);
+		// Make sure immediate is an appropriate size
+		if (!(final.imm < 32768) || !(final.imm >= -32768)){
+			printf("Immediate field too large\n");
+			exit(0);
+		}
+	}
+	else if (strcmp("haltSimulation", instructionFields[0]) == 0){
+	    final.opcode = -1;
+	}
+	else{
+		printf("Illegal opcode\n");
+		exit(0);
+	}
+	
+	// DO THE CHECKS ON APPROPRIATE MEMORY ADDRESSES IN MAIN OR HERE OR SOMETHING.
+	
+	return final;
+}
+
+// Returns the register number associated with the register's conventional name
+int getRegNum(char* conventionalName){
+		if ((strcmp("$zero", conventionalName) == 0) || (strcmp("$0", conventionalName) == 0))
+			return 0;
+		else if ((strcmp("$at", conventionalName) == 0) || (strcmp("$1", conventionalName) == 0))
+			return 1;
+		else if ((strcmp("$v0", conventionalName) == 0) || (strcmp("$2", conventionalName) == 0))
+			return 2;
+		else if ((strcmp("$v1", conventionalName) == 0) || (strcmp("$3", conventionalName) == 0))
+			return 3;
+		else if ((strcmp("$a0", conventionalName) == 0) || (strcmp("$4", conventionalName) == 0))
+			return 4;
+		else if ((strcmp("$a1", conventionalName) == 0) || (strcmp("$5", conventionalName) == 0))
+			return 5;
+		else if ((strcmp("$a2", conventionalName) == 0) || (strcmp("$6", conventionalName) == 0))
+			return 6;
+		else if ((strcmp("$a3", conventionalName) == 0) || (strcmp("$7", conventionalName) == 0))
+			return 7;
+		else if ((strcmp("$t0", conventionalName) == 0) || (strcmp("$8", conventionalName) == 0))
+			return 8;
+		else if ((strcmp("$t1", conventionalName) == 0) || (strcmp("$9", conventionalName) == 0))
+			return 9;
+		else if ((strcmp("$t2", conventionalName) == 0) || (strcmp("$10", conventionalName) == 0))
+			return 10;
+		else if ((strcmp("$t3", conventionalName) == 0) || (strcmp("$11", conventionalName) == 0))
+			return 11;
+		else if ((strcmp("$t4", conventionalName) == 0) || (strcmp("$12", conventionalName) == 0))
+			return 12;
+		else if ((strcmp("$t5", conventionalName) == 0) || (strcmp("$13", conventionalName) == 0))
+			return 13;
+		else if ((strcmp("$t6", conventionalName) == 0) || (strcmp("$14", conventionalName) == 0))
+			return 14;
+		else if ((strcmp("$t7", conventionalName) == 0) || (strcmp("$15", conventionalName) == 0))
+			return 15;
+		else if ((strcmp("$s0", conventionalName) == 0) || (strcmp("$16", conventionalName) == 0))
+			return 16;
+		else if ((strcmp("$s1", conventionalName) == 0) || (strcmp("$17", conventionalName) == 0))
+			return 17;
+		else if ((strcmp("$s2", conventionalName) == 0) || (strcmp("$18", conventionalName) == 0))
+			return 18;
+		else if ((strcmp("$s3", conventionalName) == 0) || (strcmp("$19", conventionalName) == 0))
+			return 19;
+		else if ((strcmp("$s4", conventionalName) == 0) || (strcmp("$20", conventionalName) == 0))
+			return 20;
+		else if ((strcmp("$s5", conventionalName) == 0) || (strcmp("$21", conventionalName) == 0))
+			return 21;
+		else if ((strcmp("$s6", conventionalName) == 0) || (strcmp("$22", conventionalName) == 0))
+			return 22;
+		else if ((strcmp("$s7", conventionalName) == 0) || (strcmp("$23", conventionalName) == 0))
+			return 23;
+		else if ((strcmp("$t8", conventionalName) == 0) || (strcmp("$24", conventionalName) == 0))
+			return 24;
+		else if ((strcmp("$t9", conventionalName) == 0) || (strcmp("$25", conventionalName) == 0))
+			return 25;
+		else if ((strcmp("$k0", conventionalName) == 0) || (strcmp("$26", conventionalName) == 0))
+			return 26;
+		else if ((strcmp("$k1", conventionalName) == 0) || (strcmp("$27", conventionalName) == 0))
+			return 27;
+		else if ((strcmp("$gp", conventionalName) == 0) || (strcmp("$28", conventionalName) == 0))
+			return 28;
+		else if ((strcmp("$sp", conventionalName) == 0) || (strcmp("$29", conventionalName) == 0))
+			return 29;
+		else if ((strcmp("$fp", conventionalName) == 0) || (strcmp("$30", conventionalName) == 0))
+			return 30;
+		else if ((strcmp("$ra", conventionalName) == 0) || (strcmp("$31", conventionalName) == 0))
+			return 31;
+		else{
+			printf("Unrecognized register name\n");
+			exit(0);
+		}
+}
+
+int isHazard(struct inst curr, struct inst prev, struct inst prev2, struct inst prev3){ // returns 1 when hazard, 0 when no hazard
+	int prev_dest;
+	int prev2_dest;
+	if(prev3.opcode == BEQ){
+		return 1;
+	}
+	if(curr.opcode == -1){
+		// (no hazard)
+	}
+	//	Check prev ---------------------------------------------------------------------------------------
+	switch(prev.opcode){		//  Check Hazard with PREV
+		//	Destination: rd
+		case ADD:
+		case MULT:
+		case SUB:
+			prev_dest = prev.rd;
+		break;
+		//	Destination: rt
+		case ADDI:
+		case LW:
+			prev_dest = prev.rt;
+		break;
+		//	Destination: pgm_c
+		case BEQ:
+			return 1;
+		break;
+		//	Destination: mem
+		case SW:
+		//	(no hazard)	
+		break;
+		//	Destination: none
+		case 0:
+		case -1:
+		// (no hazard)
+		break;
+	}
+	//	If curr - MULT, ADD, BEQ, or SUB
+	if((curr.opcode == MULT) || (curr.opcode == ADD) || (curr.opcode == BEQ) || (curr.opcode == SUB)){
+		if((prev_dest == curr.rs) || (prev_dest == curr.rt)){
+			return 1;
+		}
+		else{
+			// (no hazard)
+		}
+	}
+	//	If curr = ADDI or LW
+	else if((curr.opcode == ADDI) || (curr.opcode == LW)){
+		if(prev_dest == curr.rs){
+			return 1;
+		}
+		else{
+			// (no hazard)
+		}
+	}
+	//	If curr = SW
+	else if(curr.opcode == SW){
+		if(prev_dest == curr.rt){
+			return 1;
+		}
+		else{
+			// (no hazard)
+		}
+	}
+	//	Check prev2 ---------------------------------------------------------------------------------------	
+	switch(prev2.opcode){		//  Check Hazard with PREV2
+		//	Destination: rd
+		case ADD:
+		case MULT:
+		case SUB:
+			prev_dest = prev2.rd;
+		break;
+		//	Destination: rt
+		case ADDI:
+		case LW:
+			prev_dest = prev2.rt;
+		break;
+		//	Destination: pgm_c
+		case BEQ:
+			return 1;
+		break;
+		//	Destination: mem
+		case SW:
+			// (no hazard)
+		break;
+		//	Destination: none
+		case 0:
+		case -1:
+			// (no hazard)
+		break;
+	}
+	//	If curr = MULT, ADD, BEQ, or SUB
+	if((curr.opcode == MULT) || (curr.opcode == ADD) || (curr.opcode == BEQ) || (curr.opcode == SUB)){
+		if((prev_dest == curr.rs) || (prev_dest == curr.rt)){
+			return 1;
+		}
+		else{
+			// (no hazard)
+		}
+	}
+	//	If curr = ADDI or LW
+	else if((curr.opcode == ADDI) || (curr.opcode == LW)){
+		if(prev_dest == curr.rs){
+			return 1;
+		}
+		else{
+			// (no hazard)
+		}
+	}
+	//	If curr = SW
+	else if(curr.opcode == SW){
+		if(prev_dest == curr.rt){
+			return 1;
+		}
+		else{
+			// (no hazard)
+		}
+	}
+	return 0;
+}
+
+// Instruction Fetch
+void IF(struct inst mips_inst, struct inst *latch, int *IF_c, int c){
+    (*latch) = mips_inst;
+    if(((*latch).opcode != 0) && ((*latch).opcode != -1)){
+        *IF_c += c;
+    }
+    //printf("IF_ID:");
+    //print_inst((*latch));
+}
+
+// Instrtuction Decode
+void ID(struct inst *IF_ID_latch, struct inst *ID_EX_latch, long mips_reg_array[], int *ID_c){
+	(*ID_EX_latch) = (*IF_ID_latch);
+	if(((*IF_ID_latch).opcode != 0) && ((*IF_ID_latch).opcode != -1)){
+		*ID_c += 1;
+	}
+	//printf("ID_EX:");
+    //print_inst((*ID_EX_latch));
+}
+
+// Execute
+void EX(struct inst *ex_mem, struct inst *id_ex, int *ex_count, int mul_m, int else_n, long r[]){
+	if(((*id_ex).opcode != 0) && ((*id_ex).opcode != -1)){	//	If not nop
+		//	Update Count
+		if((*id_ex).opcode != MULT){
+			*ex_count += else_n;
+			//printf("[EX]: Incrementing *ex_count by %d\n", else_n);
+		}
+		else{
+			*ex_count += mul_m;
+			//printf("[EX]: Incrementing *ex_count by %d\n", mul_m);
+		}
+    }
+    *ex_mem = *id_ex;
+    //printf("EX_MEM:");
+    //print_inst((*ex_mem));
+}
+
+// Memory
+void MEM(struct inst *mem_wb, struct inst *ex_mem, int load_store_c, int *mem_count, long r[], long m[], long *pgm_count, int *inst_count, int n_inst){
+	if(((*ex_mem).opcode != 0) && ((*ex_mem).opcode != -1)){	//	If not nop
+		//	Update Count
+		if(((*ex_mem).opcode == LW) || ((*ex_mem).opcode == SW)) {
+			*mem_count += load_store_c;
+			//printf("[MEM]: Incrementing *mem_count by %d\n", load_store_c);
+		}
+    	//  Handle SW
+		if((*ex_mem).opcode == SW){
+			if((r[(*ex_mem).rs] + (*ex_mem).imm) > 512){
+				printf("INVALID MEM ADDRESS\n");
+				exit(0);
+			}
+    		m[r[(*ex_mem).rs] + (*ex_mem).imm] = r[(*ex_mem).rt];
+    	}
+    	//	Handle BEQ
+    	if((*ex_mem).opcode == BEQ){
+    	    //printf("(*ex_mem).imm:   %d\n 4*(*ex_mem).imm:    %d\n", (*ex_mem).imm, 4*(*ex_mem).imm);
+    	    //printf("*pgm_count:    %d\n", *pgm_count);
+    	    
+    	    int branch = *pgm_count + 4*(*ex_mem).imm;
+    		if(r[(*ex_mem).rs] == r[(*ex_mem).rt]){
+    			if(((branch/4) >= 0) && ((branch/4) < n_inst)) {
+	    			*pgm_count = branch;
+	    			*inst_count = *pgm_count / 4;
+    			}
+    			else{
+    				printf("INVALID BRANCH ADDRESS\n");
+					exit(0);
+    			}
+    		}
+    	}
+	}
+	*mem_wb = *ex_mem;
+	//printf("MEM_WB:");
+    //print_inst((*mem_wb));
+}
+
+// Write Back
+void WB(struct inst *mem_wb, int *wb_count, long r[], long m[]){
+	if(((*mem_wb).opcode != 0) && ((*mem_wb).opcode != -1)){	//	If not nop
+		// Update Count
+		if(((*mem_wb).opcode != SW) && (*mem_wb).opcode != BEQ) { *wb_count += 1; }
+		// Handle Instructions (not SW and BEQ)
+    	switch ((*mem_wb).opcode){
+    		case MULT:
+    	    	r[(*mem_wb).rd] = r[(*mem_wb).rs] * r[(*mem_wb).rt];
+    	    	break;
+    		case ADD:
+    	    	r[(*mem_wb).rd] = r[(*mem_wb).rs] + r[(*mem_wb).rt];
+    	    	break;
+    		case SUB:
+    	    	r[(*mem_wb).rd] = r[(*mem_wb).rs] - r[(*mem_wb).rt];
+    	    	break;
+    		case ADDI:
+    		 	r[(*mem_wb).rt] = r[(*mem_wb).rs] + (*mem_wb).imm;
+    	    	break;
+    		case LW:
+    	    	r[(*mem_wb).rt] = m[r[(*mem_wb).rs] + (*mem_wb).imm];
+    	    	break;
+    		case SW:
+    	    	//	Do Nothing
+    	    	break;
+    		case BEQ:
+    	    	//	Do Nothing
+    	    	break;
+    		default:
+    		    printf("OPCODE ERROR\n");
+    		    break;
+    	}
+	}
+}
+
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+// END CODE
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+
